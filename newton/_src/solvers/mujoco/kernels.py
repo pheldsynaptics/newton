@@ -11,6 +11,7 @@ import warp as wp
 
 from ...core.types import vec5
 from ...geometry.flags import ShapeFlags
+from ...geometry.hashtable import HASHTABLE_EMPTY_KEY, hashtable_find, hashtable_find_or_insert
 from ...geometry.inertia import _eig_inertia
 from ...sim import BodyFlags, JointTargetMode, JointType
 from ...sim.articulation import eval_joint_motion
@@ -3947,3 +3948,259 @@ def convert_mj_particles_to_warp_kernel(
     va = particle_qvel_adr[p]
     particle_q[i] = particle_q0[p] + wp.vec3(qpos[world, qa], qpos[world, qa + 1], qpos[world, qa + 2])
     particle_qd[i] = wp.vec3(qvel[world, va], qvel[world, va + 1], qvel[world, va + 2])
+
+
+# ---------------------------------------------------------------------------
+# Hydroelastic friction position term (prototype).
+#
+# Below the friction limit, the friction rows of force-space hydroelastic
+# contacts have no position term, so a steady tangential load leaves a slow,
+# steady slip. These kernels keep one tangential offset per pair of shapes.
+# Every step they integrate the pair's mean tangential slip velocity into the
+# offset, keep its in-plane part, cap its length at a small multiple of what
+# friction can hold, and subtract gain times offset (projected on each friction
+# axis) from the reference acceleration of the pair's two sliding-friction rows.
+# The elliptic cones still bound each contact's friction force.
+#
+# Two hash tables keyed by shape pair hold the pairs of this step and of the
+# previous one; each step starts from an empty table and keeps only the pairs
+# in contact. A step has at most one pair per contact and a table has two to
+# four times naconmax slots (twice, rounded up to a power of two), so it cannot
+# fill, whatever pairs come and go or how often worlds reset.
+#
+# This is a prototype. Its limits are listed in the solver documentation. One
+# more follows from the mean: each contact's slip is taken in its own tangent
+# plane, so where a body tilts into a soft surface the contact face follows the
+# tilt. It does not drift.
+# ---------------------------------------------------------------------------
+
+
+@wp.func
+def _hydroelastic_pair_key(a: int, b: int) -> wp.uint64:
+    """Order-independent 64-bit key of a shape pair: the lower index in the high 32 bits."""
+    return (wp.uint64(wp.min(a, b)) << wp.uint64(32)) | wp.uint64(wp.max(a, b))
+
+
+# Replaces the key of a previous-step pair cleared by a reset: lookups probe past it, and no pair has this key.
+_HYDROELASTIC_PAIR_KEY_RESET = wp.constant(wp.uint64(0xFFFFFFFFFFFFFFFE))
+
+# Time scale of the term in timesteps. Below one step the term stops holding; larger
+# values hold equally but give more under load. 2 keeps a margin of two above the limit.
+_HYDROELASTIC_FRICTION_POSITION_STEPS = wp.constant(2.0)
+
+
+@wp.func
+def _hydroelastic_friction_position_gain(timestep: float) -> float:
+    """Reference acceleration per unit offset [1/s^2]; zero for a zero timestep."""
+    if timestep <= 0.0:
+        return 0.0
+    tau = _HYDROELASTIC_FRICTION_POSITION_STEPS * timestep
+    return 1.0 / (tau * tau)
+
+
+# A unique module, always compiled without deterministic mode: the solver compiles the module of the other kernels
+# in this file in the requested mode, and the shared hash table's insert cannot be compiled in deterministic mode.
+# The term rejects deterministic mode, so this kernel never runs in it.
+@wp.kernel(
+    enable_backward=False,
+    module="unique",
+    module_options={"deterministic": wp.DeterministicMode.NOT_GUARANTEED},
+)
+def accumulate_hydroelastic_friction_offset_kernel(
+    contact_count: wp.array[int],
+    pressure_contact: wp.array[bool],
+    shape0: wp.array[int],
+    shape1: wp.array[int],
+    shape_flags: wp.array[int],
+    solref_mode: wp.array[int],
+    stiffness: wp.array[float],
+    tid_to_cid: wp.array[int],
+    nacon: wp.array[int],
+    contact_frame: wp.array[wp.mat33],
+    contact_friction: wp.array[vec5],
+    contact_dist: wp.array[float],
+    contact_margin: wp.array[float],
+    contact_dim: wp.array[int],
+    contact_world: wp.array[int],
+    contact_address: wp.array2d[int],
+    speculative_clearance: wp.array[float],
+    nefc: wp.array[int],
+    efc_D: wp.array2d[float],
+    efc_vel: wp.array2d[float],
+    # outputs
+    keys: wp.array[wp.uint64],
+    active_slots: wp.array[wp.int32],
+    slot_of_tid: wp.array[int],
+    pair_world: wp.array[int],
+    pair_w: wp.array[float],
+    pair_mufn: wp.array[float],
+    pair_n: wp.array[wp.vec3],
+    pair_v: wp.array[wp.vec3],
+):
+    """Per contact: find its pair's slot; record its world; add its friction weight, friction capacity, normal and
+    slip velocity."""
+    tid = wp.tid()
+    slot_of_tid[tid] = -1
+    if tid >= contact_count[0] or not pressure_contact[tid]:
+        return
+    cid = tid_to_cid[tid]
+    if cid < 0 or cid >= nacon[0]:
+        return
+    if speculative_clearance and speculative_clearance[cid] > 0.0:
+        return
+    a = shape0[tid]
+    b = shape1[tid]
+    if a < 0 or b < 0 or not _hydroelastic_pair_enabled(shape_flags, solref_mode, a, b):
+        return
+    ke = stiffness[tid]
+    if ke <= 0.0 or contact_dim[cid] < 3:
+        return
+    world = contact_world[cid]
+    row = contact_address[cid, 1]
+    row2 = contact_address[cid, 2]
+    if row < 0 or row >= nefc[world] or row2 < 0 or row2 >= nefc[world]:
+        return
+    slot = hashtable_find_or_insert(_hydroelastic_pair_key(a, b), keys, active_slots)
+    if slot < 0:
+        return
+    slot_of_tid[tid] = slot
+    # All contacts of a pair lie in one MuJoCo world.
+    pair_world[slot] = world
+    frame = contact_frame[cid]
+    t1 = wp.vec3(frame[1, 0], frame[1, 1], frame[1, 2])
+    s2 = wp.dot(t1, t1)
+    w = efc_D[world, row] * s2
+    fn = ke * wp.max(-(contact_dist[cid] - contact_margin[cid]), 0.0)
+    mu = contact_friction[cid][0] * wp.sqrt(s2)
+    wp.atomic_add(pair_w, slot, w)
+    wp.atomic_add(pair_mufn, slot, mu * fn)
+    wp.atomic_add(pair_n, slot, w * wp.vec3(frame[0, 0], frame[0, 1], frame[0, 2]))
+    # Tangential relative velocity at the contact (row velocities are along the scaled axes).
+    t2 = wp.vec3(frame[2, 0], frame[2, 1], frame[2, 2])
+    v = (efc_vel[world, row] * t1 + efc_vel[world, row2] * t2) / s2
+    wp.atomic_add(pair_v, slot, w * v)
+
+
+@wp.kernel(enable_backward=False)
+def update_hydroelastic_friction_offset_kernel(
+    cap_factor: float,
+    timestep: wp.array[float],
+    keys: wp.array[wp.uint64],
+    pair_world: wp.array[int],
+    pair_w: wp.array[float],
+    pair_mufn: wp.array[float],
+    pair_n: wp.array[wp.vec3],
+    pair_v: wp.array[wp.vec3],
+    prev_keys: wp.array[wp.uint64],
+    prev_offset: wp.array[wp.vec3],
+    # outputs
+    pair_offset: wp.array[wp.vec3],
+):
+    """Per pair of this step: integrate the mean tangential slip into the pair's offset of the previous step,
+    capped at a small multiple of what friction can hold. A pair absent in the previous step starts from zero."""
+    slot = wp.tid()
+    key = keys[slot]
+    if key == HASHTABLE_EMPTY_KEY:
+        return
+    w = pair_w[slot]
+    x = wp.vec3(0.0)
+    prev = hashtable_find(key, prev_keys)
+    if prev >= 0 and w > 0.0:
+        n = wp.normalize(pair_n[slot])
+        h = timestep[pair_world[slot] % timestep.shape[0]]
+        position_gain = _hydroelastic_friction_position_gain(h)
+        x = prev_offset[prev] + h * pair_v[slot] / w
+        x = x - wp.dot(x, n) * n
+        # The cones bound each contact's force; the cap only stops wind-up while sliding. It allows for
+        # contacts that saturate before the pair does (friction weight is not proportional to pressure).
+        cap = cap_factor * pair_mufn[slot] / (w * position_gain)
+        length = wp.length(x)
+        if length > cap:
+            x = x * (cap / length)
+    pair_offset[slot] = x
+
+
+@wp.kernel(enable_backward=False)
+def apply_hydroelastic_friction_offset_kernel(
+    contact_count: wp.array[int],
+    slot_of_tid: wp.array[int],
+    tid_to_cid: wp.array[int],
+    timestep: wp.array[float],
+    pair_offset: wp.array[wp.vec3],
+    contact_frame: wp.array[wp.mat33],
+    contact_world: wp.array[int],
+    contact_address: wp.array2d[int],
+    nefc: wp.array[int],
+    efc_aref: wp.array2d[float],
+):
+    """Per contact: add the pair's stored in-plane offset as a position term to the two sliding-friction rows."""
+    tid = wp.tid()
+    if tid >= contact_count[0]:
+        return
+    slot = slot_of_tid[tid]
+    if slot < 0:
+        return
+    cid = tid_to_cid[tid]
+    offset = pair_offset[slot]
+    frame = contact_frame[cid]
+    world = contact_world[cid]
+    position_gain = _hydroelastic_friction_position_gain(timestep[world % timestep.shape[0]])
+    for axis in range(1, 3):
+        row = contact_address[cid, axis]
+        if row >= 0 and row < nefc[world]:
+            x_row = frame[axis, 0] * offset[0] + frame[axis, 1] * offset[1] + frame[axis, 2] * offset[2]
+            efc_aref[world, row] = efc_aref[world, row] - position_gain * x_row
+
+
+@wp.kernel(enable_backward=False)
+def advance_hydroelastic_friction_offset_kernel(
+    # in/out
+    keys: wp.array[wp.uint64],
+    active_slots: wp.array[wp.int32],
+    pair_world: wp.array[int],
+    pair_w: wp.array[float],
+    pair_mufn: wp.array[float],
+    pair_n: wp.array[wp.vec3],
+    pair_v: wp.array[wp.vec3],
+    pair_offset: wp.array[wp.vec3],
+    # outputs
+    prev_keys: wp.array[wp.uint64],
+    prev_world: wp.array[int],
+    prev_offset: wp.array[wp.vec3],
+):
+    """Per slot: make this step's pairs the previous step's and empty the table for the next step.
+
+    Both tables have the same capacity and hash, so copying slot by slot keeps every probe sequence valid.
+    """
+    slot = wp.tid()
+    prev_keys[slot] = keys[slot]
+    prev_world[slot] = pair_world[slot]
+    prev_offset[slot] = pair_offset[slot]
+    keys[slot] = HASHTABLE_EMPTY_KEY
+    pair_w[slot] = 0.0
+    pair_mufn[slot] = 0.0
+    pair_n[slot] = wp.vec3(0.0)
+    pair_v[slot] = wp.vec3(0.0)
+    if slot == 0:
+        active_slots[keys.shape[0]] = 0
+
+
+@wp.kernel(enable_backward=False)
+def reset_hydroelastic_friction_offset_kernel(
+    world_mask: wp.array[wp.bool],
+    prev_world: wp.array[int],
+    # in/out
+    prev_keys: wp.array[wp.uint64],
+):
+    """Per pair of the previous step in a selected world: forget it, so it restarts from a zero offset.
+
+    A ``None`` ``world_mask`` selects every pair. A pair belongs to the MuJoCo world its contacts were in, the
+    index the solver's other per-world buffers are reset by.
+    """
+    slot = wp.tid()
+    key = prev_keys[slot]
+    if key == HASHTABLE_EMPTY_KEY or key == _HYDROELASTIC_PAIR_KEY_RESET:
+        return
+    if world_mask and not world_mask[prev_world[slot]]:
+        return
+    prev_keys[slot] = _HYDROELASTIC_PAIR_KEY_RESET

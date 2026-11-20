@@ -1041,6 +1041,42 @@ body masses and contact subdivision. Sliding couples normal and friction
 forces. Slow creep is possible below the friction limit and depends on
 contact subdivision.
 
+**Friction position term.** Below the friction limit, the friction rows of
+these contacts act as dampers, so a steady sideways load leaves a slow, steady
+slip. ``SolverMuJoCo(hydroelastic_friction_position_term=True)`` adds a
+position term: per pair of shapes, the solver integrates the pair's mean
+tangential slip into an offset and pulls the friction rows back toward where
+the pair started to stick. The offset is capped at a small multiple of what friction can
+hold, and the friction cones still bound each contact's force, so the friction limit is
+unchanged. The option is an on/off switch, off by default. There is nothing to
+tune: the term acts on a time scale of two timesteps, so it gets stiffer as the
+``dt`` passed to :meth:`~newton.solvers.SolverMuJoCo.step` gets smaller.
+It requires the setup above; the solver raises :class:`ValueError` where the
+term cannot take effect and in deterministic mode (set by the ``deterministic``
+argument or inherited from ``wp.config.deterministic``).
+
+The term has costs. The offsets are solver state, not part of
+:class:`~newton.State`, so a step depends on the solver's history: repeating a
+step from the same state gives a different result unless
+:meth:`~newton.solvers.SolverMuJoCo.reset` is called before each repeat, and
+captured CUDA graphs replay with the history they find. Each step adds four
+kernel launches, and the solver keeps two hash tables of two to four times
+``naconmax`` slots. Known limits:
+the offset is kept in world axes; rotation about the contact normal is not
+held; a pair absent for one step restarts from a zero offset; and the per-pair
+sums use float atomics, so results are not deterministic.
+
+MuJoCo's NoSlip pass (``noslip_iterations``) reduces the same slip and adds no
+state of its own between steps. In a hold test of a 20 g box under a steady
+sideways load at half and at 0.9 of the friction limit, with the default shape
+damping, three NoSlip iterations and the position term each cut the slip to
+less than a twentieth. NoSlip is an extra solver pass in every step.
+
+.. experimental::
+
+   The friction position term is a prototype and may change or be removed
+   without prior notice.
+
 Backend contact frames have scaled tangent rows and compensating friction
 coefficients. Newton still reports forces in world coordinates. Raw MuJoCo
 sensors and viewers that assume unit tangent rows need special care.

@@ -18,6 +18,7 @@ from newton._src.geometry.contact_reduction_hydroelastic import (
     _from_fixed,
     _to_fixed,
 )
+from newton._src.geometry.hashtable import HashTable, hashtable_find_or_insert
 from newton._src.geometry.sdf_hydroelastic import (
     _MAX_DETERMINISTIC_ISO_VOXELS,
     _extract_mc_corner_pair,
@@ -30,6 +31,11 @@ from newton._src.geometry.sdf_hydroelastic import (
 from newton._src.geometry.sdf_mc import _get_marching_cubes_class, get_triangle_fraction
 from newton._src.geometry.utils import _scan_scratch_size, scan_with_total
 from newton._src.solvers.mujoco.constants import SOLREF_MODE_FORCE_SPACE, SOLREF_MODE_MJCF_DEFAULT, SOLREF_MODE_RAW
+from newton._src.solvers.mujoco.kernels import (
+    _hydroelastic_pair_key,
+    apply_hydroelastic_friction_offset_kernel,
+    update_hydroelastic_friction_offset_kernel,
+)
 from newton.geometry import HydroelasticSDF
 from newton.tests.unittest_utils import (
     MUJOCO_MODULES,
@@ -2652,6 +2658,18 @@ def test_fixed_point_extreme_exponents(test, device):
     np.testing.assert_array_equal(shifts.numpy(), expected_shifts)
 
 
+@wp.kernel
+def _friction_position_pair_slots(
+    shape_a: wp.array[int],
+    shape_b: wp.array[int],
+    keys: wp.array[wp.uint64],
+    active_slots: wp.array[wp.int32],
+    slots: wp.array[int],
+):
+    i = wp.tid()
+    slots[i] = hashtable_find_or_insert(_hydroelastic_pair_key(shape_a[i], shape_b[i]), keys, active_slots)
+
+
 def _mujoco_contacts(count=1, stiffness=1.0e4, damping=0.0, *, swapped=False):
     """Split a 5 mm penetrating patch into unequal pressure weights."""
     contacts = newton.Contacts(rigid_contact_max=count, soft_contact_max=0, per_contact_shape_properties=True)
@@ -2813,7 +2831,10 @@ class TestMuJoCoHydroelastic(unittest.TestCase):
             np.testing.assert_allclose(state_out.body_qd.numpy(), expected[index], atol=1.0e-7, rtol=1.0e-5)
 
     def test_soft_slab_friction(self):
-        """Check sticking, sliding, and world-space contact forces."""
+        """Check sticking, sliding, and world-space contact forces, with and without the friction position term.
+
+        With the term, the box must also hold a steady load below the friction limit without creep.
+        """
         mass, mu, load, dt = 0.02, 0.4, 1.0, 1.0 / 1920.0
         builder = newton.ModelBuilder()
         newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
@@ -2857,43 +2878,335 @@ class TestMuJoCoHydroelastic(unittest.TestCase):
             sdf_hydroelastic_config=HydroelasticSDF.Config(reduce_contacts=False, buffer_fraction=1.0),
         )
         contacts = pipeline.contacts()
+
+        def run(position_term):
+            solver = newton.solvers.SolverMuJoCo(
+                model,
+                use_mujoco_contacts=False,
+                cone="elliptic",
+                nconmax=2048,
+                njmax=8192,
+                hydroelastic_friction_position_term=position_term,
+            )
+            observables = solver.observables(contacts=contacts, kinds={solver.ObservableKind.CONTACT_F})
+            state_in, state_out = model.state(), model.state()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
+            wrench = np.zeros((model.body_count, 6), dtype=np.float32)
+            wrench[body, 2] = -(load + mass * model.gravity.numpy()[0, 2])
+
+            def push(force, steps):
+                nonlocal state_in, state_out
+                wrench[body, 0] = force
+                state_in.body_f.assign(wrench)
+                for _ in range(steps):
+                    pipeline.collide(state_in, contacts)
+                    solver.step(state_in, state_out, None, contacts, dt, observables=observables)
+                    state_in, state_out = state_out, state_in
+                    wp.copy(state_in.body_f, state_out.body_f)
+
+            push(0.0, 200)
+            self.assertLess(float(np.abs(state_in.body_qd.numpy()[body, 3:]).max()), 0.02)
+            start = float(state_in.body_q.numpy()[body, 0])
+            for step in range(100):
+                push(0.5 * mu * load * (step + 1) / 100, 1)
+            push(0.5 * mu * load, 100)
+            self.assertLess(abs(float(state_in.body_q.numpy()[body, 0]) - start), 6.0e-5)
+            self.assertLess(abs(float(state_in.body_qd.numpy()[body, 0])), 1.0e-3)
+            # Force readout must undo the backend's tangent scaling.
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            np.testing.assert_allclose(
+                observables.contact_f.numpy()[:count, :3].sum(axis=0), [0.5 * mu * load, 0.0, -load], atol=0.02
+            )
+            if position_term:
+                # Held at half the friction limit, the box creeps at about 0.35 um/s without the term.
+                held = float(state_in.body_q.numpy()[body, 0])
+                push(0.5 * mu * load, 100)
+                creep = (float(state_in.body_q.numpy()[body, 0]) - held) / (100 * dt)
+                self.assertLess(abs(creep), 0.05e-6)
+            speed = float(state_in.body_qd.numpy()[body, 0])
+            push(1.5 * mu * load, 20)
+            gained = float(state_in.body_qd.numpy()[body, 0]) - speed
+            expected = 20 * dt * 0.5 * mu * load / mass
+            self.assertAlmostEqual(gained, expected, delta=0.2 * expected)
+
+        for position_term in (False, True):
+            with self.subTest(position_term=position_term):
+                run(position_term)
+
+    def test_friction_position_pair_keys(self):
+        """Keep distinct friction-position slots for pairs of large shape indices.
+
+        The pairs include indices whose product exceeds the int32 range and the largest int32 indices.
+        """
+        pairs = np.array([(0, 20000), (67296, 61356), (49998, 49999), (49999, 49998), (2**31 - 2, 2**31 - 1)])
+        table = HashTable(16)
+        slots = wp.zeros(len(pairs), dtype=int)
+        wp.launch(
+            _friction_position_pair_slots,
+            dim=len(pairs),
+            inputs=[wp.array(pairs[:, 0], dtype=int), wp.array(pairs[:, 1], dtype=int), table.keys, table.active_slots],
+            outputs=[slots],
+        )
+        slots = slots.numpy()
+        self.assertTrue(np.all(slots >= 0))
+        # Swapped shapes name the same pair.
+        self.assertEqual(slots[2], slots[3])
+        self.assertEqual(len(set(slots[[0, 1, 2, 4]].tolist())), 4)
+        keys = table.keys.numpy()[slots].astype(np.uint64)
+        np.testing.assert_array_equal(keys >> np.uint64(32), pairs.min(axis=1))
+        np.testing.assert_array_equal(keys & np.uint64(0xFFFFFFFF), pairs.max(axis=1))
+
+    def test_friction_position_timestep_per_world(self):
+        """Use each world's own timestep in the offset update and in the friction rows' position term."""
+        rng = np.random.default_rng(7)
+        world_count, cap_factor = 3, 4.0
+        # Two pairs per world: the first ones far below their cap, the last ones above it.
+        pairs = np.array([(0, 1 + i) for i in range(2 * world_count)])
+        pair_world = np.arange(2 * world_count) % world_count
+        mufn = np.where(np.arange(2 * world_count) < world_count, 10.0, 1.0e-3)
+        w = rng.uniform(0.5, 2.0, len(pairs))
+        n = rng.normal(size=(len(pairs), 3)) * 0.1 + np.array([0.0, 0.0, 1.0])
+        v = rng.normal(size=(len(pairs), 3)) * 0.01
+        prev_offset = rng.normal(size=(len(pairs), 3)) * 1.0e-5
+        # Contact c belongs to pair c and fills rows 3 * (c // world_count) + (0, 1, 2) of its world.
+        contact_world = pair_world
+        address = 3 * (np.arange(len(pairs)) // world_count)[:, None] + np.arange(3)
+        frame = rng.normal(size=(len(pairs), 3, 3))
+        tid_to_cid = np.append(np.arange(len(pairs))[::-1], 0)
+        aref = rng.normal(size=(world_count, 8))
+
+        def insert(table):
+            slots = wp.zeros(len(pairs), dtype=int)
+            ints = [wp.array(pairs[:, i], dtype=int) for i in (0, 1)]
+            wp.launch(
+                _friction_position_pair_slots,
+                dim=len(pairs),
+                inputs=[*ints, table.keys, table.active_slots],
+                outputs=[slots],
+            )
+            return slots.numpy()
+
+        def scatter(slots, values, dtype, size=16):
+            out = np.zeros((size, *values.shape[1:]))
+            out[slots] = values
+            return wp.array(out, dtype=dtype)
+
+        for timestep in ([0.002, 0.001, 0.004], [0.002]):
+            h = np.array(timestep)[np.arange(world_count) % len(timestep)]
+            gain = 1.0 / (2.0 * h) ** 2
+            table, prev_table = HashTable(16), HashTable(16)
+            slots, prev_slots = insert(table), insert(prev_table)
+            offset = wp.zeros(16, dtype=wp.vec3)
+            wp.launch(
+                update_hydroelastic_friction_offset_kernel,
+                dim=16,
+                inputs=[
+                    cap_factor,
+                    wp.array(timestep, dtype=float),
+                    table.keys,
+                    scatter(slots, pair_world, int),
+                    scatter(slots, w, float),
+                    scatter(slots, mufn, float),
+                    scatter(slots, n, wp.vec3),
+                    scatter(slots, v, wp.vec3),
+                    prev_table.keys,
+                    scatter(prev_slots, prev_offset, wp.vec3),
+                ],
+                outputs=[offset],
+            )
+            unit = n / np.linalg.norm(n, axis=1, keepdims=True)
+            hp = h[pair_world][:, None]
+            x = prev_offset + hp * v / w[:, None]
+            x -= np.sum(x * unit, axis=1, keepdims=True) * unit
+            length = np.linalg.norm(x, axis=1)
+            cap = cap_factor * mufn / (w * gain[pair_world])
+            with self.subTest(kernel="update", timestep=timestep):
+                # The cap applies exactly to the pairs meant to be above it.
+                np.testing.assert_array_equal(length > cap, mufn < 1.0)
+                expected = x * np.minimum(1.0, cap / length)[:, None]
+                np.testing.assert_allclose(offset.numpy()[slots], expected, rtol=1.0e-5, atol=1.0e-12)
+
+            # Apply random offsets in reversed contact order; the extra last thread has no pair and changes no row.
+            offset_np = rng.normal(size=(len(pairs), 3)) * 1.0e-5
+            efc_aref = wp.array(aref, dtype=float)
+            wp.launch(
+                apply_hydroelastic_friction_offset_kernel,
+                dim=len(tid_to_cid),
+                inputs=[
+                    wp.array([len(tid_to_cid)], dtype=int),
+                    wp.array(np.append(slots[tid_to_cid[:-1]], -1), dtype=int),
+                    wp.array(tid_to_cid, dtype=int),
+                    wp.array(timestep, dtype=float),
+                    scatter(slots, offset_np, wp.vec3),
+                    wp.array(frame, dtype=wp.mat33),
+                    wp.array(contact_world, dtype=int),
+                    wp.array(address, dtype=int),
+                    wp.array([6] * world_count, dtype=int),
+                    efc_aref,
+                ],
+            )
+            expected = aref.copy()
+            for c in range(len(pairs)):
+                for axis in (1, 2):
+                    expected[contact_world[c], address[c, axis]] -= (
+                        gain[contact_world[c]] * frame[c, axis] @ offset_np[c]
+                    )
+            with self.subTest(kernel="apply", timestep=timestep):
+                np.testing.assert_allclose(efc_aref.numpy(), expected, rtol=1.0e-5, atol=1.0e-6)
+
+    def test_friction_position_table_keeps_current_pairs(self):
+        """Hold only the pairs in contact in the friction-position tables as contact moves between shapes."""
+        model = _mujoco_model(positions=(0.0, 0.3, 0.6), solref_modes=(SOLREF_MODE_FORCE_SPACE,) * 4)
+        solver = _mujoco_solver(model, hydroelastic_friction_position_term=True)
+        state_in, state_out = _mujoco_states(model, velocity=0.0)
+        contacts = _mujoco_contacts(4)
+        tables = solver._hydroelastic_friction_offset
+        for step, box in enumerate((1, 2, 3, 1, 2, 3)):
+            if step == 3:
+                solver.reset(state_in, flags=0)
+            contacts.rigid_contact_shape1.fill_(box)
+            contacts.rigid_contact_point0.fill_(wp.vec3(0.3 * (box - 1), 0.0, 0.0975))
+            contacts.contact_generation.fill_(step + 1)
+            solver.step(state_in, state_out, None, contacts, 0.002)
+            with self.subTest(step=step):
+                self.assertTrue(np.all(tables["slot"].numpy()[:4] >= 0))
+                keys = np.concatenate([a.numpy() for a in tables.values() if a.dtype == wp.uint64])
+                # Empty slots and pairs forgotten by a reset use the two largest key values.
+                np.testing.assert_array_equal(keys[keys < np.uint64(2**64 - 2)], [np.uint64(box)])
+
+    def test_friction_position_reset_restarts_offsets(self):
+        """Restart the friction-position offsets of the worlds a reset selects, and keep the others."""
+        model = _mujoco_model()
+        solver = _mujoco_solver(model, hydroelastic_friction_position_term=True)
+        state_in, state_out = _mujoco_states(model, velocity=0.0)
+        # Sliding along x, so every step adds slip to the pair's offset.
+        state_in.joint_qd.assign(np.array([0.01, 0.0, 0.0, 0.0, 0.0, 0.0]))
+        contacts = _mujoco_contacts(4)
+        tables = solver._hydroelastic_friction_offset
+
+        def offset():
+            keys = tables["prev_keys"].numpy()
+            kept = keys < np.uint64(2**64 - 2)
+            self.assertLessEqual(int(kept.sum()), 1)
+            return float(np.linalg.norm(tables["prev_offset"].numpy()[kept])) if kept.any() else 0.0
+
+        for _ in range(3):
+            solver.step(state_in, state_out, None, contacts, 0.002)
+        before = offset()
+        self.assertGreater(before, 0.0)
+        # The final entry is the global world; a mask without world 0 keeps its offset.
+        for mask in ([False, False], [False, True]):
+            solver.reset(state_in, world_mask=wp.array(mask, dtype=wp.bool), flags=0)
+            self.assertEqual(offset(), before)
+        solver.step(state_in, state_out, None, contacts, 0.002)
+        # A kept pair continues from its offset (here already at the cap); a restarted one would be zero.
+        self.assertGreater(offset(), 0.0)
+        # A pair forgotten by the reset starts again from a zero offset in the next step.
+        for mask in ([True, False], None):
+            solver.reset(state_in, world_mask=None if mask is None else wp.array(mask, dtype=wp.bool), flags=0)
+            solver.step(state_in, state_out, None, contacts, 0.002)
+            self.assertEqual(offset(), 0.0)
+            solver.step(state_in, state_out, None, contacts, 0.002)
+            self.assertGreater(offset(), 0.0)
+
+    def test_friction_position_reset_selects_worlds(self):
+        """Restart only the friction-position offsets of the worlds a masked reset selects, in a three-world model."""
+        world_count = 3
+        cfg = newton.ModelBuilder.ShapeConfig(mu=0.4, margin=0.0, gap=0.0, sdf_max_resolution=8, density=125.0)
+        cfg.is_hydroelastic = True
+        attributes = {"mujoco:solref_mode": SOLREF_MODE_FORCE_SPACE}
+        builder, template = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0)), newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        for part in (builder, template):
+            newton.solvers.SolverMuJoCo.register_custom_attributes(part)
+        # One global surface shared by every world, so a pair's world comes from its box only.
+        builder.add_shape_box(-1, hx=1.0, hy=0.2, hz=0.1, cfg=cfg, custom_attributes=attributes)
+        body = template.add_body(xform=wp.transform((0.0, 0.0, 0.095), wp.quat_identity()))
+        template.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=cfg, custom_attributes=attributes)
+        for _ in range(world_count):
+            builder.add_world(template)
+        model = builder.finalize()
+        model.mujoco.condim.fill_(3)
+        solver = _mujoco_solver(model, hydroelastic_friction_position_term=True)
+        state_in, state_out = _mujoco_states(model, velocity=0.0)
+        state_in.joint_qd.assign(np.tile([0.01, 0.0, 0.0, 0.0, 0.0, 0.0], world_count))
+        contacts = _mujoco_contacts(4 * world_count)
+        # Four contacts between the surface (shape 0) and the box of each world (shape 1 + world).
+        contacts.rigid_contact_shape1.assign(np.repeat(np.arange(1, world_count + 1, dtype=np.int32), 4))
+        tables = solver._hydroelastic_friction_offset
+
+        def offsets():
+            """Offset length of each world's pair in the previous-step table; zero once the pair is forgotten."""
+            keys, offset = tables["prev_keys"].numpy(), tables["prev_offset"].numpy()
+            # The key of the pair (0, box) is the box's shape index.
+            slots = [np.flatnonzero(keys == np.uint64(1 + world)) for world in range(world_count)]
+            return np.array([float(np.linalg.norm(offset[s[0]])) if len(s) else 0.0 for s in slots])
+
+        for mask in ([False, True, False, False], [True, False, True, False]):
+            for _ in range(3):
+                solver.step(state_in, state_out, None, contacts, 0.002)
+            before = offsets()
+            self.assertTrue(np.all(before > 0.0))
+            solver.reset(state_in, world_mask=wp.array(mask, dtype=wp.bool), flags=0)
+            with self.subTest(mask=mask):
+                np.testing.assert_array_equal(offsets(), np.where(mask[:world_count], 0.0, before))
+
+    def test_friction_position_skips_contacts_without_friction_rows(self):
+        """Leave out of the friction offset a contact whose second friction row did not fit in ``njmax``."""
+        model = _mujoco_model()
+        # Four contacts with three rows each; the last row of the last contact does not fit.
         solver = newton.solvers.SolverMuJoCo(
-            model, use_mujoco_contacts=False, cone="elliptic", nconmax=2048, njmax=8192
+            model,
+            use_mujoco_contacts=False,
+            cone="elliptic",
+            nconmax=16,
+            njmax=11,
+            iterations=50,
+            tolerance=1.0e-10,
+            hydroelastic_friction_position_term=True,
         )
-        observables = solver.observables(contacts=contacts, kinds={solver.ObservableKind.CONTACT_F})
-        state_in, state_out = model.state(), model.state()
-        newton.eval_fk(model, model.joint_q, model.joint_qd, state_in)
-        wrench = np.zeros((model.body_count, 6), dtype=np.float32)
-        wrench[body, 2] = -(load + mass * model.gravity.numpy()[0, 2])
+        state_in, state_out = _mujoco_states(model, velocity=0.0)
+        state_in.joint_qd.assign(np.array([0.01, 0.0, 0.0, 0.0, 0.0, 0.0]))
+        solver.step(state_in, state_out, None, _mujoco_contacts(4), 0.002)
+        cids = solver._contact_tid_to_cid.numpy()[:4]
+        rows = solver.mjw_data.contact.efc_address.numpy()[cids, :3]
+        self.assertTrue(np.all(rows[:, :2] >= 0))
+        missing = rows[:, 2] < 0
+        self.assertEqual(int(missing.sum()), 1)
+        slots = solver._hydroelastic_friction_offset["slot"].numpy()[:4]
+        np.testing.assert_array_equal(slots < 0, missing)
+        self.assertTrue(np.all(np.isfinite(solver._hydroelastic_friction_offset["prev_offset"].numpy())))
+        self.assertTrue(np.all(np.isfinite(state_out.body_qd.numpy())))
 
-        def push(force, steps):
-            nonlocal state_in, state_out
-            wrench[body, 0] = force
-            state_in.body_f.assign(wrench)
-            for _ in range(steps):
-                pipeline.collide(state_in, contacts)
-                solver.step(state_in, state_out, None, contacts, dt, observables=observables)
-                state_in, state_out = state_out, state_in
-                wp.copy(state_in.body_f, state_out.body_f)
+    def test_friction_position_zero_timestep(self):
+        """Keep the state finite through a step with ``dt = 0`` and the steps after it."""
+        model = _mujoco_model()
+        solver = _mujoco_solver(model, hydroelastic_friction_position_term=True)
+        state_in, state_out = _mujoco_states(model, velocity=0.0)
+        state_in.joint_qd.assign(np.array([0.01, 0.0, 0.0, 0.0, 0.0, 0.0]))
+        contacts = _mujoco_contacts(4)
+        for step, dt in enumerate((0.002, 0.002, 0.002, 0.0, 0.002)):
+            solver.step(state_in, state_out, None, contacts, dt)
+            state_in, state_out = state_out, state_in
+            with self.subTest(step=step, dt=dt):
+                self.assertTrue(np.all(np.isfinite(state_in.body_q.numpy())))
+                self.assertTrue(np.all(np.isfinite(state_in.body_qd.numpy())))
 
-        push(0.0, 200)
-        self.assertLess(float(np.abs(state_in.body_qd.numpy()[body, 3:]).max()), 0.02)
-        start = float(state_in.body_q.numpy()[body, 0])
-        for step in range(100):
-            push(0.5 * mu * load * (step + 1) / 100, 1)
-        push(0.5 * mu * load, 100)
-        self.assertLess(abs(float(state_in.body_q.numpy()[body, 0]) - start), 6.0e-5)
-        self.assertLess(abs(float(state_in.body_qd.numpy()[body, 0])), 1.0e-3)
-        # Force readout must undo the backend's tangent scaling.
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        np.testing.assert_allclose(
-            observables.contact_f.numpy()[:count, :3].sum(axis=0), [0.5 * mu * load, 0.0, -load], atol=0.02
-        )
-        speed = float(state_in.body_qd.numpy()[body, 0])
-        push(1.5 * mu * load, 20)
-        gained = float(state_in.body_qd.numpy()[body, 0]) - speed
-        expected = 20 * dt * 0.5 * mu * load / mass
-        self.assertAlmostEqual(gained, expected, delta=0.2 * expected)
+    def test_friction_position_rejects_unsupported_setups(self):
+        """Reject the friction position term where it cannot take effect."""
+        model = _mujoco_model()
+        with self.assertRaisesRegex(ValueError, 'cone="elliptic"'):
+            _mujoco_solver(model, cone="pyramidal", hydroelastic_friction_position_term=True)
+        # RK4 and MuJoCo contacts also warn about force-space shapes; the error is what this test checks.
+        with self.assertRaisesRegex(ValueError, "implicitfast integrator"), self.assertWarns(newton.NewtonWarning):
+            _mujoco_solver(model, integrator="rk4", hydroelastic_friction_position_term=True)
+        with self.assertRaisesRegex(ValueError, "Newton contacts"), self.assertWarns(newton.NewtonWarning):
+            newton.solvers.SolverMuJoCo(model, use_mujoco_contacts=True, hydroelastic_friction_position_term=True)
+        with self.assertRaisesRegex(ValueError, "force-space"):
+            _mujoco_solver(_mujoco_model(solref_modes=None), hydroelastic_friction_position_term=True)
+        with self.assertRaisesRegex(ValueError, "deterministic mode"):
+            _mujoco_solver(
+                model, deterministic=wp.DeterministicMode.RUN_TO_RUN, hydroelastic_friction_position_term=True
+            )
 
 
 @requires(*MUJOCO_MODULES)

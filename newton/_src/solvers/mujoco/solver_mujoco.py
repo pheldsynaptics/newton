@@ -24,6 +24,7 @@ from ...core._warnings import _external_warning_stacklevel
 from ...core.types import MAXVAL, Axis, override, vec5, vec10
 from ...exceptions import NewtonDeprecationWarning, NewtonWarning
 from ...geometry import GeoType, Mesh, ParticleFlags, ShapeFlags
+from ...geometry.hashtable import HashTable
 from ...sim import (
     BodyFlags,
     Contacts,
@@ -74,7 +75,10 @@ from .geometry import build_shape_layout, compile_layout_collision_masks
 from .joint_springs import finalize_springref, finalize_stiffness
 from .kernels import (
     _sync_nacon_count,
+    accumulate_hydroelastic_friction_offset_kernel,
+    advance_hydroelastic_friction_offset_kernel,
     apply_hydroelastic_compliance_kernel,
+    apply_hydroelastic_friction_offset_kernel,
     apply_mjc_body_f_kernel,
     apply_mjc_control_kernel,
     apply_mjc_free_joint_f_to_body_f_kernel,
@@ -102,6 +106,7 @@ from .kernels import (
     hinge_connect_anchor,
     mass_matrix_diagonal_kernel,
     repeat_array_kernel,
+    reset_hydroelastic_friction_offset_kernel,
     reset_joint_state_kernel,
     reset_particle_state_kernel,
     reset_sleeping_state_kernel,
@@ -124,6 +129,7 @@ from .kernels import (
     update_eq_data_and_active_kernel,
     update_eq_properties_kernel,
     update_geom_properties_kernel,
+    update_hydroelastic_friction_offset_kernel,
     update_jnt_properties_kernel,
     update_jnt_reference_kernel,
     update_jnt_solref_from_invweight0_kernel,
@@ -4614,6 +4620,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         deterministic: wp.DeterministicMode | None = None,
         strict_capacity: bool = False,
         kinematic_switchable_roots: bool = True,
+        hydroelastic_friction_position_term: bool = False,
     ):
         """
         Solver options (e.g., ``impratio``) follow this resolution priority:
@@ -4722,6 +4729,29 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 weld so it can be switched to kinematic at runtime. If ``False``, only roots
                 that are kinematic in some world at construction get one, which keeps the
                 compiled MuJoCo model free of unused welds.
+            hydroelastic_friction_position_term: If ``True``, add a position term to the friction
+                rows of force-space hydroelastic contacts (:ref:`mujoco-hydroelastic-response`).
+                Per pair of shapes, the solver integrates the mean tangential slip into an offset
+                and feeds it back into the pair's friction rows, so that a steady tangential load
+                below the friction limit is held without slow creep. There is nothing to tune: the
+                term acts on a time scale of two timesteps, so it gets stiffer as the ``dt`` passed
+                to :meth:`step` gets smaller. The offset is capped at a small multiple of
+                what friction can hold, and the friction cones still bound each contact's force. Off by default. It requires
+                the force-space hydroelastic setup (Newton contacts on MuJoCo Warp,
+                ``cone="elliptic"``, Euler, implicit, or implicitfast integration, and force-space
+                hydroelastic shapes) and is not supported in deterministic mode, whether set by
+                ``deterministic`` or inherited from ``wp.config.deterministic``; otherwise a
+                :class:`ValueError` is raised.
+
+                .. experimental::
+
+                    This option is a prototype and may change or be removed without prior notice.
+                    The offset is kept in world axes, and rotation about the contact normal is not
+                    remembered. The offset is solver state, not part of :class:`~newton.State`,
+                    so a step depends on the solver's history. :meth:`reset` clears it for the
+                    selected worlds; to repeat a step from the same state, call
+                    ``reset(state, flags=0)`` before the first step and again before the repeat.
+                    Results are not deterministic.
 
         """
         if update_data_interval is not None:
@@ -4731,6 +4761,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         if use_speculative_contacts and use_mujoco_contacts:
             raise ValueError("use_speculative_contacts=True requires Newton contacts on the MuJoCo Warp backend.")
         self._use_speculative_contacts = use_speculative_contacts
+        self._hydroelastic_friction_position_term = hydroelastic_friction_position_term
+        # Per-pair offset state; allocated with the contact map below when the option is on.
+        self._hydroelastic_friction_offset: dict | None = None
+        # Offset cap as a multiple of the pair's mu * normal force / (position gain * friction weight).
+        self._hydroelastic_friction_offset_cap_factor = 4.0
 
         # Import and cache MuJoCo modules (only happens once per class)
         mujoco, _ = self.import_mujoco()
@@ -5164,6 +5199,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             # first run inside a CUDA graph that is discarded without replay.
             self._create_inverse_shape_mapping()
             self._contact_tid_to_cid = wp.full(self.mjw_data.naconmax, -1, dtype=wp.int32, device=self.device)
+        if self._hydroelastic_friction_position_term:
+            self._require_hydroelastic_friction_position_support()
+            self._hydroelastic_friction_offset = self._allocate_hydroelastic_friction_offset(self.mjw_data.naconmax)
         self._initial_model_sync = False
         self._update_data_interval = 1 if update_data_interval is None else update_data_interval
         self._step = 0
@@ -5464,7 +5502,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         them. This method therefore always zeros, per world, ``qacc_warmstart``,
         ``qfrc_applied``, ``xfrc_applied``, ``act`` and ``ctrl``. (``qacc`` is
         left alone: the solver overwrites it from ``qacc_warmstart`` at the start
-        of every step.)
+        of every step.) With ``hydroelastic_friction_position_term`` on,
+        it also clears the friction offsets of the shape pairs in those worlds.
 
         In addition, the requested entries of the Newton :class:`~newton.State`
         are reset to the model defaults (``model.joint_q`` / ``model.joint_qd``)
@@ -5589,6 +5628,15 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             inputs=[world_mask, *buffers],
             device=self.model.device,
         )
+        if self._hydroelastic_friction_offset is not None:
+            st = self._hydroelastic_friction_offset
+            wp.launch(
+                reset_hydroelastic_friction_offset_kernel,
+                dim=st["prev_keys"].shape[0],
+                inputs=[world_mask, st["prev_world"]],
+                outputs=[st["prev_keys"]],
+                device=self.model.device,
+            )
         if self.enable_sleeping:
             self._update_mjc_data(d, self.model, state, world_mask=world_mask)
             self._wake_sleeping_worlds(world_mask, clear_overflow=True)
@@ -5907,6 +5955,122 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 data.efc.vel,
             ],
             outputs=[data.efc.D, data.efc.aref],
+            device=self.device,
+        )
+        if self._hydroelastic_friction_offset is not None:
+            self._apply_hydroelastic_friction_offset(model, data, contacts)
+
+    def _require_hydroelastic_friction_position_support(self) -> None:
+        """Reject the friction position term where the force-space hydroelastic pass does not run."""
+        if self._use_mujoco_contacts or self.use_mujoco_cpu:
+            reason = "it needs Newton contacts on the MuJoCo Warp backend (use_mujoco_contacts=False)"
+        elif not self._has_force_space_hydroelastic:
+            reason = "the model has no hydroelastic shapes with force-space mujoco:solref_mode 0"
+        elif not self._supports_hydroelastic_compliance():
+            reason = 'it needs cone="elliptic" and the Euler, implicit, or implicitfast integrator'
+        elif self._deterministic != wp.DeterministicMode.NOT_GUARANTEED:
+            reason = "its per-pair sums use float atomics, so it cannot honor deterministic mode"
+        else:
+            return
+        raise ValueError(f"hydroelastic_friction_position_term is not supported here: {reason}.")
+
+    def _allocate_hydroelastic_friction_offset(self, naconmax: int) -> dict:
+        """Per-pair friction offset state: hash tables keyed by shape pair for this step and the previous one.
+
+        Each holds at most one pair per contact; two to four times naconmax slots (twice, rounded up to a power
+        of two) keep the probes short.
+        """
+        table = HashTable(2 * naconmax, device=self.device)
+        cap = table.capacity
+        dev = self.device
+        return {
+            "keys": table.keys,
+            "active": table.active_slots,
+            "slot": wp.full(naconmax, -1, dtype=int, device=dev),
+            "world": wp.zeros(cap, dtype=int, device=dev),
+            "w": wp.zeros(cap, dtype=float, device=dev),
+            "mufn": wp.zeros(cap, dtype=float, device=dev),
+            "n": wp.zeros(cap, dtype=wp.vec3, device=dev),
+            "v": wp.zeros(cap, dtype=wp.vec3, device=dev),
+            "offset": wp.zeros(cap, dtype=wp.vec3, device=dev),
+            "prev_keys": wp.clone(table.keys),
+            "prev_world": wp.zeros(cap, dtype=int, device=dev),
+            "prev_offset": wp.zeros(cap, dtype=wp.vec3, device=dev),
+        }
+
+    def _apply_hydroelastic_friction_offset(self, model: MjWarpModel, data: MjWarpData, contacts: Contacts) -> None:
+        """Per shape pair, integrate the mean tangential slip into an offset capped at what friction can hold,
+        and add it to the sliding-friction rows as a position term."""
+        n = min(contacts.rigid_contact_max, data.naconmax)
+        st = self._hydroelastic_friction_offset
+        wp.launch(
+            accumulate_hydroelastic_friction_offset_kernel,
+            dim=n,
+            inputs=[
+                contacts.rigid_contact_count,
+                contacts._hydroelastic_pressure_contact,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                self.model.shape_flags,
+                getattr(getattr(self.model, "mujoco", None), "solref_mode", None),
+                contacts.rigid_contact_stiffness,
+                self._contact_tid_to_cid,
+                data.nacon,
+                data.contact.frame,
+                data.contact.friction,
+                data.contact.dist,
+                data.contact.includemargin,
+                data.contact.dim,
+                data.contact.worldid,
+                data.contact.efc_address,
+                self._speculative_clearance if self._use_speculative_contacts else None,
+                data.nefc,
+                data.efc.D,
+                data.efc.vel,
+            ],
+            outputs=[st["keys"], st["active"], st["slot"], st["world"], st["w"], st["mufn"], st["n"], st["v"]],
+            device=self.device,
+        )
+        wp.launch(
+            update_hydroelastic_friction_offset_kernel,
+            dim=st["keys"].shape[0],
+            inputs=[
+                self._hydroelastic_friction_offset_cap_factor,
+                model.opt.timestep,
+                st["keys"],
+                st["world"],
+                st["w"],
+                st["mufn"],
+                st["n"],
+                st["v"],
+                st["prev_keys"],
+                st["prev_offset"],
+            ],
+            outputs=[st["offset"]],
+            device=self.device,
+        )
+        wp.launch(
+            apply_hydroelastic_friction_offset_kernel,
+            dim=n,
+            inputs=[
+                contacts.rigid_contact_count,
+                st["slot"],
+                self._contact_tid_to_cid,
+                model.opt.timestep,
+                st["offset"],
+                data.contact.frame,
+                data.contact.worldid,
+                data.contact.efc_address,
+                data.nefc,
+            ],
+            outputs=[data.efc.aref],
+            device=self.device,
+        )
+        wp.launch(
+            advance_hydroelastic_friction_offset_kernel,
+            dim=st["keys"].shape[0],
+            inputs=[st["keys"], st["active"], st["world"], st["w"], st["mufn"], st["n"], st["v"], st["offset"]],
+            outputs=[st["prev_keys"], st["prev_world"], st["prev_offset"]],
             device=self.device,
         )
 
